@@ -9,7 +9,7 @@
  * Variables). The GitHub Actions build writes it into this file.
  * ------------------------------------------------------------------------ */
 window.ISS_CONFIG = {
-  apiUrl: '',
+  apiUrl: 'https://script.google.com/macros/s/AKfycbzwjKr7KajmxCwh7J0Gh-VFAM0UoG_wUL_hIVRT7Zr8OwiYuru5FXxzyc14by-J8ntKJw/exec',
 
   // Screens saved for offline use are kept this many days, then removed.
   offlineCacheDays: 30,
