@@ -34,6 +34,12 @@
   var CACHE_DAYS = Math.max(1, Number(CFG.offlineCacheDays) || 30);
   var PREFETCH_MIN = CFG.prefetchEveryMinutes === 0 ? 0 : Math.max(2, Number(CFG.prefetchEveryMinutes) || 10);
   var PROTOCOL_VERSION = 1;
+  // Several schools can be hosted under one address
+  // (ismartschool.github.io/SchoolA/, …/SchoolB/). Browsers treat those as ONE
+  // site, so every name stored on the device carries this copy's folder:
+  // each school gets its own sign-in, saved screens and outbox.
+  var APP_PATH = location.pathname.replace(/[^/]*$/, '') || '/';
+  var NS = APP_PATH === '/' ? '' : ':' + APP_PATH;
 
   /* ---------------------------------------------------------------- policy */
   // Answers that are the same for everyone (shown before sign-in).
@@ -88,6 +94,7 @@
     registerFirstAdmin: "You're offline. Setting up the first account needs an internet connection.",
     _default: "You're offline. This action needs a connection to the school server — please try again when you're back online."
   };
+  var UNREACHABLE_MSG = "This device is online, but the school server didn't answer. Try again in a minute. If it keeps happening, the administrator should check the Apps Script deployment: Who has access must be \"Anyone\" and the newest version deployed (Troubleshooting: \"No server\").";
   var QUEUED_MSG = "Saved on this device. It will be sent to the server automatically when you're back online.";
 
   function isRead(fn) { return /^(get|search)/.test(fn) || !!PUBLIC_READS[fn]; }
@@ -136,7 +143,7 @@
   /* ----------------------------------------------------------------- store */
   // IndexedDB with an in-memory fallback (private browsing / blocked storage).
   var store = (function () {
-    var DB_NAME = 'iss-offline', VERSION = 1, dbp = null, mem = null;
+    var DB_NAME = 'iss-offline' + NS, VERSION = 1, dbp = null, mem = null;
     function memStore() {
       var m = { cache: new Map(), outbox: new Map(), meta: new Map() };
       return {
@@ -275,12 +282,13 @@
   }
   // A failed call: tell "no internet" apart from "internet fine, but the
   // school server can't be reached" (wrong URL, deployment not public…).
+  // Resolves once the state is known, so callers can word their message.
   function markUnreachable(kind) {
-    if (global.navigator && navigator.onLine === false) { setState({ network: 'offline' }); startRetryLoop(); return; }
-    if (kind === 'unavailable' || kind === 'timeout') { setState({ network: 'unreachable' }); startRetryLoop(); return; }
-    fetch('manifest.webmanifest?__probe=' + Date.now(), { cache: 'no-store' })
-      .then(function (r) { setState({ network: r.ok ? 'unreachable' : 'offline' }); }, function () { setState({ network: 'offline' }); })
-      .then(startRetryLoop);
+    if (global.navigator && navigator.onLine === false) { setState({ network: 'offline' }); startRetryLoop(); return Promise.resolve('offline'); }
+    if (kind === 'unavailable' || kind === 'timeout') { setState({ network: 'unreachable' }); startRetryLoop(); return Promise.resolve('unreachable'); }
+    return fetch('manifest.webmanifest?__probe=' + Date.now(), { cache: 'no-store' })
+      .then(function (r) { return r.ok ? 'unreachable' : 'offline'; }, function () { return 'offline'; })
+      .then(function (net) { setState({ network: net }); startRetryLoop(); return net; });
   }
   var retryTimer = null, retryDelay = 15000;
   function startRetryLoop() {
@@ -424,7 +432,7 @@
 
   /* --------------------------------------------------------------- outbox */
   var outboxMem = [];
-  var channel = global.BroadcastChannel ? new BroadcastChannel('iss-sync') : null;
+  var channel = global.BroadcastChannel ? new BroadcastChannel('iss-sync' + NS) : null;
   if (channel) channel.onmessage = function (ev) { if (ev.data === 'outbox-changed') loadOutbox(); };
   function loadOutbox() {
     return ready.then(function () { return store.all('outbox'); }).then(function (all) {
@@ -471,13 +479,13 @@
   function registerBackgroundSync() {
     try {
       if (global.navigator && navigator.serviceWorker && navigator.serviceWorker.ready) {
-        navigator.serviceWorker.ready.then(function (reg) { if (reg.sync) return reg.sync.register('iss-outbox'); }).catch(function () {});
+        navigator.serviceWorker.ready.then(function (reg) { if (reg.sync) return reg.sync.register('iss-outbox' + NS); }).catch(function () {});
       }
     } catch (e) {}
   }
   function withSendLock(work) {
     if (global.navigator && navigator.locks && navigator.locks.request) {
-      return navigator.locks.request('iss-outbox', { ifAvailable: true }, function (lock) { return lock ? work() : null; });
+      return navigator.locks.request('iss-outbox' + NS, { ifAvailable: true }, function (lock) { return lock ? work() : null; });
     }
     return work();
   }
@@ -569,13 +577,18 @@
     var knownOffline = global.navigator && navigator.onLine === false;
 
     function onNetworkFailure(err) {
-      markUnreachable(err.kind);
+      var probing = markUnreachable(err.kind);
       if (read && !NO_CACHE[fn]) return fromCache(fn, params, { kind: state.network });
       if (rule) return enqueue(fn, params);
       if (err.kind === 'timeout' && !read) {
         throw makeError('The server took too long to answer. The change may still have been saved — please check before trying again.', { offline: true, kind: 'timeout' });
       }
-      throw offlineError(fn, err.kind);
+      // Internet works but the school server gave no usable answer: say so,
+      // instead of "You're offline", so the real cause gets looked at.
+      return probing.then(function (net) {
+        if (net === 'unreachable') throw makeError(UNREACHABLE_MSG, { offline: true, kind: 'unreachable', name: 'OfflineError' });
+        throw offlineError(fn, err.kind);
+      });
     }
 
     if (knownOffline) return ready.then(function () { return onNetworkFailure({ kind: 'network' }); });
@@ -628,6 +641,7 @@
     isQueueable: function (fn) { return !!QUEUE[fn]; },
     pendingCount: function () { return state.pending; },
     describeStudent: null,
+    nsSuffix: NS,          // appended to every name this copy stores on the device
     setSession: function (s) {
       session = s && s.email && s.token ? { email: String(s.email).toLowerCase(), token: s.token } : null;
       recount();
@@ -676,7 +690,37 @@
     }
   };
 
-  ready.then(function () { setState({ persistent: store.persistent }); loadOutbox(); purgeOldCache(); });
+  ready.then(function () { setState({ persistent: store.persistent }); loadOutbox(); purgeOldCache();
+    // After every script on the page has run, so it can see which app.js is loaded.
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', removeSharedLegacyData); else removeSharedLegacyData();
+  });
+
+  // Versions before per-school storage kept everything in one shared
+  // database and one shared sign-in slot. Remove them so no school's data
+  // lingers where another school's copy could read it. A database that
+  // still holds unsent changes is kept (and reported) rather than lost.
+  function removeSharedLegacyData() {
+    if (!NS) return;
+    // An older app.js (uploaded without the matching api.js) still keeps its
+    // sign-in here: leave it alone rather than sign the user out on every load.
+    if (global.App && App._SESSION_KEY === 'iss-session') { console.warn('[ISSApi] app.js is older than api.js — upload the matching app.js.'); return; }
+    try { localStorage.removeItem('iss-session'); sessionStorage.removeItem('iss-session'); } catch (e) {}
+    if (!global.indexedDB || !indexedDB.databases) return;
+    indexedDB.databases().then(function (list) {
+      if (!list.some(function (d) { return d.name === 'iss-offline'; })) return;
+      var req = indexedDB.open('iss-offline');
+      req.onsuccess = function () {
+        var db = req.result;
+        if (!db.objectStoreNames.contains('outbox')) { db.close(); indexedDB.deleteDatabase('iss-offline'); return; }
+        var c = db.transaction('outbox', 'readonly').objectStore('outbox').count();
+        c.onsuccess = function () {
+          db.close();
+          if (c.result === 0) indexedDB.deleteDatabase('iss-offline');
+          else console.warn('[ISSApi] An older shared offline database still holds ' + c.result + ' unsent change(s); it was kept.');
+        };
+      };
+    }).catch(function () {});
+  }
   if (state.network === 'offline') startRetryLoop();
 
   // The service worker asks open pages to send the outbox (Background Sync).
